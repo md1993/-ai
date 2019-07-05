@@ -1,0 +1,445 @@
+# -*- coding: utf-8 -*-
+import numpy as np 
+import pandas as pd 
+import matplotlib.pyplot as plt
+#import seaborn as sns
+import lightgbm as lgb
+#import xgboost as xgb
+from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.metrics import accuracy_score, roc_auc_score
+from scipy.stats import norm, rankdata
+import warnings
+import gc
+import os
+import time
+import sys
+import datetime
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.filterwarnings('ignore')
+from sklearn import metrics
+plt.style.use('seaborn')
+pd.set_option('display.max_columns', 500)
+
+test = pd.read_csv('/content/drive/My Drive/quanqiu/Metro_testA/testA_submit_2019-01-29.csv')
+test_28 = pd.read_csv('/content/drive/My Drive/quanqiu/Metro_testA/testA_record_2019-01-28.csv')
+#hangzhou_weather = pd.read_csv('/content/drive/My Drive/quanqiu/weather.csv')
+def get_base_features(df_):
+    df = df_.copy()
+    df['day']     = df['time'].apply(lambda x: int(x[8:10]))
+    df['week']    = pd.to_datetime(df['time']).dt.dayofweek + 1
+#    df['weekend'] = (pd.to_datetime(df.time).dt.weekday >=5).astype(int)
+    df['hour']    = df['time'].apply(lambda x: int(x[11:13]))
+    df['minute']  = df['time'].apply(lambda x: int(x[14:15]+'0'))
+    
+    result = df.groupby(['stationID', 'week', 'day', 'hour', 'minute']).status.agg(['count', 'sum']).reset_index()
+    
+    tmp = df.groupby(['stationID','status'])['deviceID'].nunique().reset_index(name='n_deviceID_of_stationID')
+    
+    tmp_out = tmp[['stationID','n_deviceID_of_stationID']][tmp['status']==0]
+    tmp_out.rename(columns={'n_deviceID_of_stationID': 'n_out_deviceID_of_stationID'}, inplace=True)
+    result = result.merge(tmp_out, on=['stationID'], how='left')
+    
+    tmp_in = tmp[['stationID','n_deviceID_of_stationID']][tmp['status']==1]
+    tmp_in.rename(columns={'n_deviceID_of_stationID': 'n_in_deviceID_of_stationID'}, inplace=True)
+    result = result.merge(tmp_in, on=['stationID'], how='left')
+      
+    tmp = df.groupby(['stationID','hour','status'])['deviceID'].nunique().reset_index(name='n_deviceID_of_stationID_hour')
+    
+    tmp_out = tmp[['stationID','hour','n_deviceID_of_stationID_hour']][tmp['status']==0]
+    tmp_out.rename(columns={'n_deviceID_of_stationID_hour': 'n_out_deviceID_of_stationID_hour'}, inplace=True)
+    result = result.merge(tmp_out, on=['stationID','hour'], how='left')
+    
+    tmp_in = tmp[['stationID','hour','n_deviceID_of_stationID_hour']][tmp['status']==1]
+    tmp_in.rename(columns={'n_deviceID_of_stationID_hour': 'n_in_deviceID_of_stationID_hour'}, inplace=True)
+    result = result.merge(tmp_in, on=['stationID','hour'], how='left')
+     
+    tmp = df.groupby(['stationID','hour','minute','status'])['deviceID'].nunique().reset_index(name='n_deviceID_of_stationID_minute')
+    
+    tmp_out = tmp[['stationID','hour','minute','n_deviceID_of_stationID_minute']][tmp['status']==0]
+    tmp_out.rename(columns={'n_deviceID_of_stationID_minute': 'n_out_deviceID_of_stationID_minute'}, inplace=True)
+    result = result.merge(tmp_out, on=['stationID','hour','minute'], how='left')
+    
+    tmp_in = tmp[['stationID','hour','minute','n_deviceID_of_stationID_minute']][tmp['status']==1]
+    tmp_in.rename(columns={'n_deviceID_of_stationID_minute': 'n_in_deviceID_of_stationID_minute'}, inplace=True)
+    result = result.merge(tmp_in, on=['stationID','hour','minute'], how='left')
+    
+    tmp = df.groupby(['stationID'])['deviceID'].nunique().reset_index(name='nuni_deviceID_of_stationID')
+    result = result.merge(tmp, on=['stationID'], how='left')
+    
+    tmp = df.groupby(['stationID','hour'])['deviceID'].nunique().reset_index(name='nuni_deviceID_of_stationID_hour')
+    result = result.merge(tmp, on=['stationID','hour'], how='left')
+
+    tmp = df.groupby(['stationID','hour','minute'])['deviceID'].nunique().reset_index(name='nuni_deviceID_of_stationID_hour_minute')
+    result  = result.merge(tmp, on=['stationID','hour','minute'], how='left')
+
+    result['inNums']  = result['sum']
+    result['outNums'] = result['count'] - result['sum']
+    
+#    result = result.merge(hangzhou_weather, on=['day'], how='left')
+    result.fillna(0, inplace=True)
+
+    del result['sum'],result['count']  
+    return result
+
+data = get_base_features(test_28)
+data_list = os.listdir('/content/drive/My Drive/quanqiu/Metro_train/')
+for i in range(0, len(data_list)):
+    if data_list[i].split('.')[-1] == 'csv':
+        print(data_list[i], i)
+        df = pd.read_csv('/content/drive/My Drive/quanqiu/Metro_train/' + data_list[i])
+        df = get_base_features(df)
+        data = pd.concat([data, df], axis=0, ignore_index=True)
+    else:
+        continue  
+data = data[(data.day!=1)]    
+data = data[(data.day!=5)&(data.day!=6)]
+data = data[(data.day!=12)&(data.day!=13)]
+data = data[(data.day!=19)&(data.day!=20)]
+data = data[(data.day!=26)&(data.day!=27)]
+
+def fix_day(d):
+    if d in [2,3,4]:
+        return d -1
+    elif d in [7,8,9,10,11]:
+        return d - 3
+    elif d in [14,15,16,17,18]:
+        return d - 5
+    elif d in [21,22,23,24,25]:
+        return d - 7
+    elif d in [28]:
+        return d - 9
+    
+data['day'] = data['day'].apply(fix_day)   
+temp_data = data[data.day!=29]
+
+test['week']    = pd.to_datetime(test['startTime']).dt.dayofweek + 1
+test['day']     = test['startTime'].apply(lambda x: int(x[8:10]))
+test['hour']    = test['startTime'].apply(lambda x: int(x[11:13]))
+test['minute']  = test['startTime'].apply(lambda x: int(x[14:15]+'0'))
+#test['weather'] = 9
+
+tmp = temp_data.groupby(['stationID','week','hour','minute'], as_index=False)['nuni_deviceID_of_stationID_hour_minute'].agg({
+                                                                        'deviceminute_mean'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','hour','minute','deviceminute_mean']]
+test = test.merge(tmp, on=['stationID','week','hour','minute'], how='left')
+test.rename(columns={'deviceminute_mean': 'nuni_deviceID_of_stationID_hour_minute'}, inplace=True)
+
+tmp = temp_data.groupby(['stationID','week','hour'], as_index=False)['nuni_deviceID_of_stationID_hour'].agg({
+                                                                        'devicehour_mean'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','hour','devicehour_mean']]
+test = test.merge(tmp, on=['stationID','week','hour'], how='left')
+test.rename(columns={'devicehour_mean': 'nuni_deviceID_of_stationID_hour'}, inplace=True)
+
+tmp = temp_data.groupby(['stationID','week'], as_index=False)['nuni_deviceID_of_stationID'].agg({
+                                                                        'device_mean'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','device_mean']]
+test = test.merge(tmp, on=['stationID','week'], how='left')
+test.rename(columns={'device_mean': 'nuni_deviceID_of_stationID'}, inplace=True)
+
+tmp = temp_data.groupby(['stationID','week'], as_index=False)['n_out_deviceID_of_stationID'].agg({
+                                                                        'out_device_mean'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','out_device_mean']]
+test = test.merge(tmp, on=['stationID','week'], how='left')
+test.rename(columns={'out_device_mean': 'n_out_deviceID_of_stationID'}, inplace=True)
+
+tmp = temp_data.groupby(['stationID','week','hour'], as_index=False)['n_out_deviceID_of_stationID_hour'].agg({
+                                                                        'out_device_mean_hour'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','hour','out_device_mean_hour']]
+test = test.merge(tmp, on=['stationID','week','hour'], how='left')
+test.rename(columns={'out_device_mean_hour': 'n_out_deviceID_of_stationID_hour'}, inplace=True)
+
+tmp = temp_data.groupby(['stationID','week','hour','minute'], as_index=False)['n_out_deviceID_of_stationID_minute'].agg({
+                                                                        'out_device_mean_minute'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','hour','minute','out_device_mean_minute']]
+test = test.merge(tmp, on=['stationID','week','hour','minute'], how='left')
+test.rename(columns={'out_device_mean_minute': 'n_out_deviceID_of_stationID_minute'}, inplace=True)
+
+tmp = temp_data.groupby(['stationID','week'], as_index=False)['n_in_deviceID_of_stationID'].agg({
+                                                                        'in_device_mean'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','in_device_mean']]
+test = test.merge(tmp, on=['stationID','week'], how='left')
+test.rename(columns={'in_device_mean': 'n_in_deviceID_of_stationID'}, inplace=True)
+
+tmp = temp_data.groupby(['stationID','week','hour'], as_index=False)['n_in_deviceID_of_stationID_hour'].agg({
+                                                                        'in_device_mean_hour'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','hour','in_device_mean_hour']]
+test = test.merge(tmp, on=['stationID','week','hour'], how='left')
+test.rename(columns={'in_device_mean_hour': 'n_in_deviceID_of_stationID_hour'}, inplace=True)
+
+tmp = temp_data.groupby(['stationID','week','hour','minute'], as_index=False)['n_in_deviceID_of_stationID_minute'].agg({
+                                                                        'in_device_mean_minute'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','hour','minute','in_device_mean_minute']]
+test = test.merge(tmp, on=['stationID','week','hour','minute'], how='left')
+test.rename(columns={'in_device_mean_minute': 'n_in_deviceID_of_stationID_minute'}, inplace=True)
+
+test = test.drop(['startTime','endTime'], axis=1)
+
+#test.to_csv('/content/drive/My Drive/quanqiu/last2_test.csv', index=False)  
+
+data = pd.concat([data,test], axis=0, ignore_index=True)
+stat_columns = ['inNums',
+                'outNums',
+                'n_in_deviceID_of_stationID_minute',
+                'n_in_deviceID_of_stationID_hour',
+                'n_in_deviceID_of_stationID',
+                'n_out_deviceID_of_stationID_minute',
+                'n_out_deviceID_of_stationID_hour',
+                'n_out_deviceID_of_stationID'
+                ]   
+def get_refer_day(d):
+    if d == 19:
+        return 29
+    else:
+        return d + 1
+    
+tmp = data.copy()   #  (192586,12)
+tmp_df = tmp[tmp.day==1]  # 第一天的数据(8941,12)
+tmp_df['day'] = tmp_df['day'] - 1   # 将第一天改为第0天
+tmp = pd.concat([tmp, tmp_df], axis=0, ignore_index=True) #(201527,12)
+tmp['day'] = tmp['day'].apply(get_refer_day)    # 29,2,3,
+
+# stat_colums['inNums','outNums']
+for f in stat_columns:
+    # 将inNums改为inNum_last
+    tmp.rename(columns={f: f+'_last'}, inplace=True)
+   
+# 只保留如下属性
+tmp = tmp[['stationID','day','hour','minute',
+            'inNums_last',
+            'outNums_last', 
+            'n_in_deviceID_of_stationID_minute_last',
+            'n_in_deviceID_of_stationID_hour_last',
+            'n_in_deviceID_of_stationID_last',
+            'n_out_deviceID_of_stationID_minute_last',
+            'n_out_deviceID_of_stationID_hour_last',
+            'n_out_deviceID_of_stationID_last']]
+# (192586,14)
+data = data.merge(tmp, on=['stationID','day','hour','minute'], how='left')
+data.fillna(0, inplace=True)
+
+stat_columns = ['inNums',
+                'outNums',
+                'n_in_deviceID_of_stationID_minute',
+                'n_in_deviceID_of_stationID_hour',
+                'n_in_deviceID_of_stationID',
+                'n_out_deviceID_of_stationID_minute',
+                'n_out_deviceID_of_stationID_hour',
+                'n_out_deviceID_of_stationID'
+                ]  
+def get_refer_day2(d):
+    if d == 18:
+        return 29
+    else:
+        return d + 2
+    
+tmp = data.copy()   #  (192586,12)
+tmp_df1 = tmp[tmp.day==1] 
+tmp_df2 = tmp[tmp.day==1]  
+tmp_df1['day'] = tmp_df1['day'] - 1   # 将第一天改为第0天
+tmp_df2['day'] = tmp_df2['day'] - 2   # 将第一天改为第-1天
+
+tmp = pd.concat([tmp, tmp_df1], axis=0, ignore_index=True) 
+tmp = pd.concat([tmp, tmp_df2], axis=0, ignore_index=True) 
+tmp['day'] = tmp['day'].apply(get_refer_day2)    # 29,2,3,
+
+# stat_colums['inNums','outNums']
+for f in stat_columns:
+    # 将inNums改为inNum_last
+    tmp.rename(columns={f: f+'_last2'}, inplace=True)
+   
+# 只保留如下属性
+tmp = tmp[['stationID','day','hour','minute',
+            'inNums_last2',
+            'outNums_last2', 
+            'n_in_deviceID_of_stationID_minute_last2',
+            'n_in_deviceID_of_stationID_hour_last2',
+            'n_in_deviceID_of_stationID_last2',
+            'n_out_deviceID_of_stationID_minute_last2',
+            'n_out_deviceID_of_stationID_hour_last2',
+            'n_out_deviceID_of_stationID_last2']]
+# (192586,14)
+data = data.merge(tmp, on=['stationID','day','hour','minute'], how='left')
+data.fillna(0, inplace=True)
+
+# 按week,hour,minute分别对inNums和outNums构造统计特征
+all_data = data[data.day!=29]
+
+tmp = all_data.groupby(['stationID','week','hour','minute'], as_index=False)['inNums'].agg({
+                                                                        'inNums_whm_max'    : 'max',
+                                                                        'inNums_whm_min'    : 'min',
+                                                                        'inNums_whm_mean'   : 'mean'
+                                                                        })
+
+data = data.merge(tmp, on=['stationID','week','hour','minute'], how='left')
+
+tmp = all_data.groupby(['stationID','week','hour','minute'], as_index=False)['outNums'].agg({
+                                                                        'outNums_whm_max'    : 'max',
+                                                                        'outNums_whm_min'    : 'min',
+                                                                        'outNums_whm_mean'   : 'mean'
+                                                                        })
+data = data.merge(tmp, on=['stationID','week','hour','minute'], how='left')
+
+tmp = all_data.groupby(['stationID','week','hour'], as_index=False)['inNums'].agg({
+                                                                        'inNums_wh_max'    : 'max',
+                                                                        'inNums_wh_min'    : 'min',
+                                                                        'inNums_wh_mean'   : 'mean'
+                                                                        })
+data = data.merge(tmp, on=['stationID','week','hour'], how='left')
+
+tmp = all_data.groupby(['stationID','week','hour'], as_index=False)['outNums'].agg({
+                                                                        'outNums_wh_max'    : 'max',
+                                                                        'outNums_wh_min'    : 'min',
+                                                                        'outNums_wh_mean'   : 'mean'
+                                                                        })
+data = data.merge(tmp, on=['stationID','week','hour'], how='left')
+
+#####################################################################
+#尝试加入按周排序的设备数    
+tmp = all_data.groupby(['stationID','week','hour','minute'], as_index=False)['n_in_deviceID_of_stationID_minute'].agg({
+                                                                        'n_in_deviceID_of_stationID_minute_whm_max'    : 'max',
+                                                                        'n_in_deviceID_of_stationID_minute_whm_min'    : 'min',
+                                                                        'n_in_deviceID_of_stationID_minute_whm_mean'   : 'mean'
+                                                                        })
+
+data = data.merge(tmp, on=['stationID','week','hour','minute'], how='left')
+
+tmp = all_data.groupby(['stationID','week','hour','minute'], as_index=False)['n_out_deviceID_of_stationID_minute'].agg({
+                                                                        'n_out_deviceID_of_stationID_minute_whm_max'    : 'max',
+                                                                        'n_out_deviceID_of_stationID_minute_whm_min'    : 'min',
+                                                                        'n_out_deviceID_of_stationID_minute_whm_mean'   : 'mean'
+                                                                        })
+
+data = data.merge(tmp, on=['stationID','week','hour','minute'], how='left')
+
+    # (192586,24)
+ 
+data.to_csv('/content/drive/My Drive/quanqiu/last2_device_data.csv', index=False)  
+
+def recover_day(d):
+    if d in [1,2,3]:
+        return d +1
+    elif d in [4,5,6,7,8]:
+        return d + 3
+    elif d in [9,10,11,12,13]:
+        return d + 5
+    elif d in [14,15,16,17,18]:
+        return d + 7
+    elif d == 19:
+        return d + 9
+    else:
+        return d
+    
+data = data.drop(['n_in_deviceID_of_stationID',
+                  'n_in_deviceID_of_stationID_hour',
+                  'n_in_deviceID_of_stationID_minute',
+                  'n_out_deviceID_of_stationID',
+                  'n_out_deviceID_of_stationID_hour',
+                  'n_out_deviceID_of_stationID_minute',
+                  'nuni_deviceID_of_stationID',
+                  'nuni_deviceID_of_stationID_hour',
+                  'nuni_deviceID_of_stationID_hour_minute'], axis=1)
+all_columns = [f for f in data.columns if f not in ['inNums','outNums']]
+### all data
+all_data = data[data.day!=29]
+all_data['day'] = all_data['day'].apply(recover_day)
+X_data = all_data[all_columns].values
+
+train = data[data.day <19]
+train['day'] = train['day'].apply(recover_day)
+# (171798,21)
+X_train = train[all_columns].values
+
+valid = data[data.day==19]
+valid['day'] = valid['day'].apply(recover_day)
+#(9124,21)
+X_valid = valid[all_columns].values
+
+# (11664,21)
+test  = data[data.day==29]
+X_test = test[all_columns].values 
+
+
+params = {
+    'boosting_type': 'gbdt',
+    'objective': 'regression',
+    'metric': 'mae',
+    'num_leaves': 31,
+    'learning_rate': 0.01,
+#    'feature_fraction': 0.9,
+    'bagging_fraction': 0.85,
+    'bagging_seed':0,
+    'bagging_freq': 1,
+#    'reg_alpha':1,
+#    'reg_lambda':2
+}
+
+######################################################inNums
+y_train = train['inNums']   # (171798) inNums
+y_valid = valid['inNums']    # (9124,)
+y_data  = all_data['inNums']  # (180922)
+lgb_train = lgb.Dataset(X_train, y_train)
+lgb_evals = lgb.Dataset(X_valid, y_valid , reference=lgb_train)
+gbm = lgb.train(params,
+                lgb_train,
+                num_boost_round=10000,
+                valid_sets=[lgb_train,lgb_evals],
+                valid_names=['train','valid'],
+                early_stopping_rounds = 200,
+                verbose_eval=1000,
+                )
+
+### all_data
+lgb_train = lgb.Dataset(X_data, y_data)
+gbm = lgb.train(params,
+                lgb_train,
+                num_boost_round=gbm.best_iteration,
+                valid_sets=[lgb_train],
+                valid_names=['train'],
+                verbose_eval=1000,
+                )
+test['inNums'] = gbm.predict(X_test)
+
+######################################################outNums
+y_train = train['outNums']
+y_valid = valid['outNums']
+y_data  = all_data['outNums']
+lgb_train = lgb.Dataset(X_train, y_train)
+lgb_evals = lgb.Dataset(X_valid, y_valid , reference=lgb_train)
+gbm = lgb.train(params,
+                lgb_train,
+                num_boost_round=10000,
+                valid_sets=[lgb_train,lgb_evals],
+                valid_names=['train','valid'],
+                early_stopping_rounds=200,
+                verbose_eval=1000,
+                )
+
+### all_data
+lgb_train = lgb.Dataset(X_data, y_data)
+gbm = lgb.train(params,
+                lgb_train,
+                num_boost_round=gbm.best_iteration,
+                valid_sets=[lgb_train],
+                valid_names=['train'],
+                verbose_eval=1000,
+                )
+test['outNums'] = gbm.predict(X_test)
+
+sub = pd.read_csv('/content/drive/My Drive/quanqiu/Metro_testA/testA_submit_2019-01-29.csv')
+sub['inNums']   = test['inNums'].values
+sub['outNums']  = test['outNums'].values
+# 结果修正
+sub.loc[sub.inNums<0 , 'inNums']  = 0
+sub.loc[sub.outNums<0, 'outNums'] = 0
+sub[['stationID', 'startTime', 'endTime', 'inNums', 'outNums']].to_csv('/content/drive/My Drive/quanqiu/yuan_sub_model.csv', index=False)
