@@ -1,0 +1,108 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Mar 25 10:55:32 2019
+
+@author: maiquer
+"""
+
+
+import numpy as np 
+import pandas as pd 
+import matplotlib.pyplot as plt
+import seaborn as sns
+import lightgbm as lgb
+import xgboost as xgb
+from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.metrics import accuracy_score, roc_auc_score
+from scipy.stats import norm, rankdata
+import warnings
+import gc
+import os
+import time
+import sys
+import datetime
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import mean_squared_error
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.filterwarnings('ignore')
+from sklearn import metrics
+
+plt.style.use('seaborn')
+sns.set(font_scale=1)
+pd.set_option('display.max_columns', 500)
+
+test = pd.read_csv('Metro_testA\\Metro_testA\\testA_submit_2019-01-29.csv')
+
+#test_28 = pd.read_csv('Metro_testA\\Metro_testA\\testA_record_2019-01-28.csv')
+train_6 = pd.read_csv('Metro_train\\record_2019-01-15.csv')
+status = train_6['status']
+inNums = 0
+outNums = 0
+for i in range(len(status)):
+    if status[i]==0:
+        inNums=inNums+1
+    else:
+        outNums=outNums+1
+        
+def get_base_features(df_):
+    
+    df = df_.copy()
+    
+    # base time
+    #添加day为第八个属性
+    df['day']     = df['time'].apply(lambda x: int(x[8:10]))
+    # 周一记为1，周二记为2，周三记为3，周四记为4，周五记为5，周六记为6，周天记为7
+    df['week']    = pd.to_datetime(df['time']).dt.dayofweek + 1
+    # 周一到周五记为0，周六周天记为1
+    df['weekend'] = (pd.to_datetime(df.time).dt.weekday >=5).astype(int)
+    df['hour']    = df['time'].apply(lambda x: int(x[11:13]))
+    df['minute']  = df['time'].apply(lambda x: int(x[14:15]+'0'))
+    
+    # count,sum count是计数
+    result = df.groupby(['stationID', 'week', 'weekend', 'day', 'hour', 'minute']).status.agg(['count', 'sum']).reset_index()
+    
+    # nunique
+    # tmp:(80,2)每个站台对应的设备数有多少个
+    tmp = df.groupby(['stationID'])['deviceID'].nunique().reset_index(name='nuni_deviceID_of_stationID')
+    # 根据站台数和之前的结果融合在一起
+    result = result.merge(tmp, on=['stationID'], how='left')
+    # 根据站台数和时间分配设备数(1676,3)
+    tmp = df.groupby(['stationID','hour'])['deviceID'].nunique().reset_index(name='nuni_deviceID_of_stationID_hour')
+    #(9124,10)
+    result = result.merge(tmp, on=['stationID','hour'], how='left')
+    #(9124,4)
+    tmp = df.groupby(['stationID','hour','minute'])['deviceID'].nunique().\
+            reset_index(name='nuni_deviceID_of_stationID_hour_minute')
+    # (9124,11)
+    result  = result.merge(tmp, on=['stationID','hour','minute'], how='left')
+    
+    # in,out
+    #(9124,13)
+    result['inNums']  = result['sum']
+    result['outNums'] = result['count'] - result['sum']
+    
+    # (9124,14)
+    result['day_since_first'] = result['day'] - 1 
+    result.fillna(0, inplace=True)
+    # (9124,12)
+    del result['sum'],result['count']
+    
+    return result
+
+df = train_6.copy()
+df['day']     = df['time'].apply(lambda x: int(x[8:10]))
+# 周一记为1，周二记为2，周三记为3，周四记为4，周五记为5，周六记为6，周天记为7
+df['week']    = pd.to_datetime(df['time']).dt.dayofweek + 1
+# 周一到周五记为0，周六周天记为1
+df['weekend'] = (pd.to_datetime(df.time).dt.weekday >=5).astype(int)
+df['hour']    = df['time'].apply(lambda x: int(x[11:13]))
+df['minute']  = df['time'].apply(lambda x: int(x[14:15]+'0'))
+
+# count,sum count是计数
+result = df.groupby(['stationID', 'week', 'weekend', 'day', 'hour', 'minute']).status.agg(['count', 'sum']).reset_index()
+result['inNums']  = result['sum']
+result['outNums'] = result['count'] - result['sum']
+del result['sum'],result['count']
+sumin = result['inNums'].sum()
+sumout = result['inNums'].sum()
