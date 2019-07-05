@@ -1,0 +1,369 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Mar 28 11:14:31 2019
+
+@author: Mr
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Mar 27 19:25:52 2019
+
+@author: Mr
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Mar 27 11:26:08 2019
+
+@author: Mr
+"""
+
+import numpy as np 
+import pandas as pd 
+import matplotlib.pyplot as plt
+#import seaborn as sns
+import lightgbm as lgb
+#import xgboost as xgb
+from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.metrics import accuracy_score, roc_auc_score
+from scipy.stats import norm, rankdata
+import warnings
+import gc
+import os
+import time
+import sys
+import datetime
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.filterwarnings('ignore')
+from sklearn import metrics
+plt.style.use('seaborn')
+pd.set_option('display.max_columns', 500)
+
+test = pd.read_csv('./Metro_testA/testA_submit_2019-01-29.csv')
+test_28 = pd.read_csv('./Metro_testA/testA_record_2019-01-28.csv')
+def get_base_features(df_):
+    df = df_.copy()
+#    df['line'] = df['lineID'].apply(lambda x: int(ord(x)-64))
+    df['day']     = df['time'].apply(lambda x: int(x[8:10]))
+    df['week']    = pd.to_datetime(df['time']).dt.dayofweek + 1
+    df['weekend'] = (pd.to_datetime(df.time).dt.weekday >=5).astype(int)
+    df['hour']    = df['time'].apply(lambda x: int(x[11:13]))
+    df['minute']  = df['time'].apply(lambda x: int(x[14:15]+'0'))
+    
+    result = df.groupby(['stationID', 'week', 'day', 'hour', 'minute']).status.agg(['count', 'sum']).reset_index()
+    
+    tmp = df.groupby(['stationID','status'])['deviceID'].nunique().reset_index(name='n_out_deviceID_of_stationID')
+    
+    result = result.merge(tmp, on=['stationID','status'], how='left')
+    
+    tmp = df.groupby(['stationID']['status'==1])['deviceID'].nunique().reset_index(name='n_in_deviceID_of_stationID')
+    result = result.merge(tmp, on=['stationID']['status'==1], how='left')
+    
+    tmp = df.groupby(['stationID','hour']['status'==0])['deviceID'].nunique().reset_index(name='n_out_deviceID_of_stationID_hour')
+    result = result.merge(tmp, on=['stationID','hour']['status'==0], how='left')
+    
+    tmp = df.groupby(['stationID','hour']['status'==1])['deviceID'].nunique().reset_index(name='n_in_deviceID_of_stationID_hour')
+    result = result.merge(tmp, on=['stationID','hour']['status'==1], how='left')
+    
+    tmp = df.groupby(['stationID','hour','minute']['status'==0])['deviceID'].nunique().reset_index(name='n_out_deviceID_of_stationID_minute')
+    result = result.merge(tmp, on=['stationID','hour','minute']['status'==0], how='left')
+    
+    tmp = df.groupby(['stationID','hour','minute']['status'==1])['deviceID'].nunique().reset_index(name='n_in_deviceID_of_stationID_minute')
+    result = result.merge(tmp, on=['stationID','hour','minute']['status'==1], how='left')
+    
+    tmp = df.groupby(['stationID'])['deviceID'].nunique().reset_index(name='nuni_deviceID_of_stationID')
+    result = result.merge(tmp, on=['stationID'], how='left')
+    
+    tmp = df.groupby(['stationID','hour'])['deviceID'].nunique().reset_index(name='nuni_deviceID_of_stationID_hour')
+    result = result.merge(tmp, on=['stationID','hour'], how='left')
+
+    tmp = df.groupby(['stationID','hour','minute'])['deviceID'].nunique().reset_index(name='nuni_deviceID_of_stationID_hour_minute')
+    result  = result.merge(tmp, on=['stationID','hour','minute'], how='left')
+
+    result['inNums']  = result['sum']
+    result['outNums'] = result['count'] - result['sum']
+    
+    result['day_since_first'] = result['day'] - 1 
+    result.fillna(0, inplace=True)
+
+    del result['sum'],result['count']  
+    return result
+
+data = get_base_features(test_28)
+data_list = os.listdir('./Metro_train/')
+for i in range(0, len(data_list)):
+    if data_list[i].split('.')[-1] == 'csv':
+        print(data_list[i], i)
+        df = pd.read_csv('./Metro_train/' + data_list[i])
+        df = get_base_features(df)
+        data = pd.concat([data, df], axis=0, ignore_index=True)
+    else:
+        continue  
+    
+data = data[(data.day!=5)&(data.day!=6)]
+data = data[(data.day!=12)&(data.day!=13)]
+data = data[(data.day!=19)&(data.day!=20)]
+data = data[(data.day!=26)&(data.day!=27)]
+
+def fix_day(d):
+    if d in [1,2,3,4]:
+        return d
+    elif d in [7,8,9,10,11]:
+        return d - 2
+    elif d in [14,15,16,17,18]:
+        return d - 4
+    elif d in [21,22,23,24,25]:
+        return d - 6
+    elif d in [28]:
+        return d - 8
+    
+data['day'] = data['day'].apply(fix_day)  
+data.to_csv('init_data.csv', index=False)  
+
+temp_data = data[data.day!=29]
+
+test['week']    = pd.to_datetime(test['startTime']).dt.dayofweek + 1
+test['weekend'] = (pd.to_datetime(test.startTime).dt.weekday >=5).astype(int)
+test['day']     = test['startTime'].apply(lambda x: int(x[8:10]))
+test['hour']    = test['startTime'].apply(lambda x: int(x[11:13]))
+test['minute']  = test['startTime'].apply(lambda x: int(x[14:15]+'0'))
+test['day_since_first'] = test['day'] - 1
+
+
+tmp = temp_data.groupby(['stationID','week','hour','minute'], as_index=False)['nuni_deviceID_of_stationID_hour_minute'].agg({
+                                                                        'deviceminute_mean'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','hour','minute','deviceminute_mean']]
+test = test.merge(tmp, on=['stationID','week','hour','minute'], how='left')
+test.rename(columns={'deviceminute_mean': 'nuni_deviceID_of_stationID_hour_minute'}, inplace=True)
+
+tmp = temp_data.groupby(['stationID','week','hour'], as_index=False)['nuni_deviceID_of_stationID_hour'].agg({
+                                                                        'devicehour_mean'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','hour','devicehour_mean']]
+test = test.merge(tmp, on=['stationID','week','hour'], how='left')
+test.rename(columns={'devicehour_mean': 'nuni_deviceID_of_stationID_hour'}, inplace=True)
+
+tmp = temp_data.groupby(['stationID','week'], as_index=False)['nuni_deviceID_of_stationID'].agg({
+                                                                        'device_mean'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','device_mean']]
+test = test.merge(tmp, on=['stationID','week'], how='left')
+test.rename(columns={'device_mean': 'nuni_deviceID_of_stationID'}, inplace=True)
+
+tmp = temp_data.groupby(['stationID','week'], as_index=False)['n_out_deviceID_of_stationID'].agg({
+                                                                        'out_device_mean'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','out_device_mean']]
+test = test.merge(tmp, on=['stationID','week'], how='left')
+test.rename(columns={'out_device_mean': 'n_out_deviceID_of_stationID'}, inplace=True)
+
+tmp = temp_data.groupby(['stationID','week','hour'], as_index=False)['n_out_deviceID_of_stationID_hour'].agg({
+                                                                        'out_device_mean_hour'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','hour','out_device_mean_hour']]
+test = test.merge(tmp, on=['stationID','week','hour'], how='left')
+test.rename(columns={'out_device_mean_hour': 'n_out_deviceID_of_stationID_hour'}, inplace=True)
+
+tmp = temp_data.groupby(['stationID','week','hour','minute'], as_index=False)['n_out_deviceID_of_stationID_minute'].agg({
+                                                                        'out_device_mean_minute'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','hour','minute','out_device_mean_minute']]
+test = test.merge(tmp, on=['stationID','week','hour','minute'], how='left')
+test.rename(columns={'out_device_mean_minute': 'n_out_deviceID_of_stationID_minute'}, inplace=True)
+
+tmp = temp_data.groupby(['stationID','week'], as_index=False)['n_in_deviceID_of_stationID'].agg({
+                                                                        'in_device_mean'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','in_device_mean']]
+test = test.merge(tmp, on=['stationID','week'], how='left')
+test.rename(columns={'in_device_mean': 'n_in_deviceID_of_stationID'}, inplace=True)
+
+tmp = temp_data.groupby(['stationID','week','hour'], as_index=False)['n_in_deviceID_of_stationID_hour'].agg({
+                                                                        'in_device_mean_hour'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','hour','in_device_mean_hour']]
+test = test.merge(tmp, on=['stationID','week','hour'], how='left')
+test.rename(columns={'in_device_mean_hour': 'n_in_deviceID_of_stationID_hour'}, inplace=True)
+
+tmp = temp_data.groupby(['stationID','week','hour','minute'], as_index=False)['n_in_deviceID_of_stationID_minute'].agg({
+                                                                        'in_device_mean_minute'   : 'mean'
+                                                                        })
+tmp = tmp[['stationID','week','hour','minute','in_device_mean_minute']]
+test = test.merge(tmp, on=['stationID','week','hour','minute'], how='left')
+test.rename(columns={'in_device_mean_minute': 'n_in_deviceID_of_stationID_minute'}, inplace=True)
+
+test = test.drop(['startTime','endTime'], axis=1)
+
+test.to_csv('test.csv', index=False)  
+
+data = pd.concat([data,test], axis=0, ignore_index=True)
+stat_columns = ['inNums','outNums']   
+def get_refer_day(d):
+    if d == 20:
+        return 29
+    else:
+        return d + 1
+    
+tmp = data.copy()   #  (192586,12)
+tmp_df = tmp[tmp.day==1]  # 第一天的数据(8941,12)
+tmp_df['day'] = tmp_df['day'] - 1   # 将第一天改为第0天
+tmp = pd.concat([tmp, tmp_df], axis=0, ignore_index=True) #(201527,12)
+tmp['day'] = tmp['day'].apply(get_refer_day)    # 29,2,3,
+
+# stat_colums['inNums','outNums']
+for f in stat_columns:
+    # 将inNums改为inNum_last
+    tmp.rename(columns={f: f+'_last'}, inplace=True)
+   
+# 只保留如下属性
+tmp = tmp[['stationID','day','hour','minute','inNums_last','outNums_last']]
+# (192586,14)
+data = data.merge(tmp, on=['stationID','day','hour','minute'], how='left')
+data.fillna(0, inplace=True)
+
+
+# 按week,hour,minute分别对inNums和outNums构造统计特征
+tmp = data.groupby(['stationID','week','hour','minute'], as_index=False)['inNums'].agg({
+                                                                        'inNums_whm_max'    : 'max',
+                                                                        'inNums_whm_min'    : 'min',
+                                                                        'inNums_whm_mean'   : 'mean'
+                                                                        })
+
+data = data.merge(tmp, on=['stationID','week','hour','minute'], how='left')
+
+tmp = data.groupby(['stationID','week','hour','minute'], as_index=False)['outNums'].agg({
+                                                                        'outNums_whm_max'    : 'max',
+                                                                        'outNums_whm_min'    : 'min',
+                                                                        'outNums_whm_mean'   : 'mean'
+                                                                        })
+data = data.merge(tmp, on=['stationID','week','hour','minute'], how='left')
+
+tmp = data.groupby(['stationID','week','hour'], as_index=False)['inNums'].agg({
+                                                                        'inNums_wh_max'    : 'max',
+                                                                        'inNums_wh_min'    : 'min',
+                                                                        'inNums_wh_mean'   : 'mean'
+                                                                        })
+data = data.merge(tmp, on=['stationID','week','hour'], how='left')
+
+tmp = data.groupby(['stationID','week','hour'], as_index=False)['outNums'].agg({
+                                                                        'outNums_wh_max'    : 'max',
+                                                                        'outNums_wh_min'    : 'min',
+                                                                        'outNums_wh_mean'   : 'mean'
+                                                                        })
+# (192586,24)
+data = data.merge(tmp, on=['stationID','week','hour'], how='left') 
+data.to_csv('data.csv', index=False)  
+
+def recover_day(d):
+    if d in [1,2,3,4]:
+        return d
+    elif d in [5,6,7,8,9]:
+        return d + 2
+    elif d in [10,11,12,13,14]:
+        return d + 4
+    elif d in [15,16,17,18,19]:
+        return d + 6
+    elif d == 20:
+        return d + 8
+    else:
+        return d
+
+all_columns = [f for f in data.columns if f not in ['weekend','inNums','outNums']]
+### all data
+all_data = data[data.day!=29]
+all_data['day'] = all_data['day'].apply(recover_day)
+X_data = all_data[all_columns].values
+
+train = data[data.day <20]
+train['day'] = train['day'].apply(recover_day)
+# (171798,21)
+X_train = train[all_columns].values
+
+valid = data[data.day==20]
+valid['day'] = valid['day'].apply(recover_day)
+#(9124,21)
+X_valid = valid[all_columns].values
+
+# (11664,21)
+test  = data[data.day==29]
+X_test = test[all_columns].values 
+
+
+params = {
+    'boosting_type': 'gbdt',
+    'objective': 'regression',
+    'metric': 'mae',
+    'num_leaves': 63,
+    'learning_rate': 0.01,
+    'feature_fraction': 0.9,
+    'bagging_fraction': 0.9,
+    'bagging_seed':0,
+    'bagging_freq': 1,
+    'verbose': 1,
+    'reg_alpha':1,
+    'reg_lambda':2
+}
+
+######################################################inNums
+y_train = train['inNums']   # (171798) inNums
+y_valid = valid['inNums']    # (9124,)
+y_data  = all_data['inNums']  # (180922)
+lgb_train = lgb.Dataset(X_train, y_train)
+lgb_evals = lgb.Dataset(X_valid, y_valid , reference=lgb_train)
+gbm = lgb.train(params,
+                lgb_train,
+                num_boost_round=10000,
+                valid_sets=[lgb_train,lgb_evals],
+                valid_names=['train','valid'],
+                early_stopping_rounds = 200,
+                verbose_eval=1000,
+                )
+
+### all_data
+lgb_train = lgb.Dataset(X_data, y_data)
+gbm = lgb.train(params,
+                lgb_train,
+                num_boost_round=gbm.best_iteration,
+                valid_sets=[lgb_train],
+                valid_names=['train'],
+                verbose_eval=1000,
+                )
+test['inNums'] = gbm.predict(X_test)
+
+######################################################outNums
+y_train = train['outNums']
+y_valid = valid['outNums']
+y_data  = all_data['outNums']
+lgb_train = lgb.Dataset(X_train, y_train)
+lgb_evals = lgb.Dataset(X_valid, y_valid , reference=lgb_train)
+gbm = lgb.train(params,
+                lgb_train,
+                num_boost_round=10000,
+                valid_sets=[lgb_train,lgb_evals],
+                valid_names=['train','valid'],
+                early_stopping_rounds=200,
+                verbose_eval=1000,
+                )
+
+### all_data
+lgb_train = lgb.Dataset(X_data, y_data)
+gbm = lgb.train(params,
+                lgb_train,
+                num_boost_round=gbm.best_iteration,
+                valid_sets=[lgb_train],
+                valid_names=['train'],
+                verbose_eval=1000,
+                )
+test['outNums'] = gbm.predict(X_test)
+
+sub = pd.read_csv('./Metro_testA/testA_submit_2019-01-29.csv')
+sub['inNums']   = test['inNums'].values
+sub['outNums']  = test['outNums'].values
+# 结果修正
+sub.loc[sub.inNums<0 , 'inNums']  = 0
+sub.loc[sub.outNums<0, 'outNums'] = 0
+sub[['stationID', 'startTime', 'endTime', 'inNums', 'outNums']].to_csv('sub_model.csv', index=False)
